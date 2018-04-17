@@ -11,7 +11,14 @@
 #                                                                   #
 #####################################################################
 
-from __future__ import division
+from __future__ import division, unicode_literals, print_function, absolute_import
+from labscript_utils import PY2
+from labscript_utils.numpy_dtype_workaround import dtype_workaround
+if PY2:
+    str = unicode
+    import __builtin__ as builtins
+else:
+    import builtins
 import os
 import sys
 import subprocess
@@ -19,7 +26,16 @@ import keyword
 from inspect import getargspec
 from functools import wraps
 
-import runmanager
+# Notes for v3
+#
+# Anything commented with TO_DELETE:runmanager-batchompiler-agnostic 
+# can be removed with a major version bump of labscript (aka v3+)
+# We leave it in now to maintain backwards compatibility between new labscript
+# and old runmanager.
+# The code to be removed relates to the move of the globals loading code from
+# labscript to runmanager batch compiler.
+
+
 import labscript_utils.h5_lock, h5py
 import labscript_utils.properties
 
@@ -33,7 +49,7 @@ from labscript_utils import check_version
 check_version('qtutils', '2.0.0', '3.0.0')
 from pylab import *
 
-import functions
+import labscript.functions as functions
 try:
     from labscript_utils.unitconversions import *
 except ImportError:
@@ -48,13 +64,9 @@ kHz = 1e3
 MHz = 1e6
 GHz = 1e9
 
-# We need to backup the builtins as they are now, as well as have a
-# reference to the actual builtins dictionary (which will change as we
-# add globals and devices to it), so that we can restore the builtins
-# when labscript_cleanup() is called. 
-import __builtin__
-_builtins_dict = __builtin__.__dict__
-_existing_builtins_dict = _builtins_dict.copy()
+# Create a reference to the builtins dict 
+# update this if accessing builtins ever changes
+_builtins_dict = builtins.__dict__
     
 # Startupinfo, for ensuring subprocesses don't launch with a visible command window:
 if os.name=='nt':
@@ -64,7 +76,7 @@ else:
     startupinfo = None
         
         
-class config:
+class config(object):
     suppress_mild_warnings = True
     suppress_all_warnings = False
     compression = 'gzip'  # set to 'gzip' for compression 
@@ -175,7 +187,7 @@ class Device(object):
         property_names = {"device_properties": ["added_properties"]}
         )
     def __init__(self,name,parent_device,connection, call_parents_add_device=True, 
-                 added_properties = {}, **kwargs):
+                 added_properties = {}, gui=None, worker=None, **kwargs):
         # Verify that no invalid kwargs were passed and the set properties
         if len(kwargs) != 0:        
             raise LabscriptError('Invalid keyword arguments: %s.'%kwargs)
@@ -213,7 +225,7 @@ class Device(object):
                                      
         try:
             # Test that name is a valid Python variable name:
-            exec '%s = None'%name
+            exec('%s = None'%name)
             assert '.' not in name
         except:
             raise ValueError('%s is not a valid Python variable name.'%name)
@@ -223,6 +235,33 @@ class Device(object):
         
         # Add self to the compiler's device inventory
         compiler.inventory.append(self)
+        
+        # handle remote workers/gui interface
+        if gui is not None or worker is not None:
+            # remote GUI and worker
+            if gui is not None:
+                # if no worker is specified, assume it is the same as the gui
+                if worker is None:
+                    worker = gui
+                    
+                # check that worker and gui are appropriately typed
+                if not isinstance(gui, _RemoteConnection):
+                    raise LabscriptError('the "gui" argument for %s must be specified as a subclass of _RemoteConnection'%(self.name))
+            else:
+                # just remote worker
+                gui = compiler._PrimaryBLACS
+            
+            if not isinstance(worker, _RemoteConnection):
+                raise LabscriptError('the "worker" argument for %s must be specified as a subclass of _RemoteConnection'%(self.name))
+            
+            # check that worker is equal to, or a child of, gui
+            if worker != gui and worker not in gui.get_all_children():
+                print(gui.get_all_children())
+                raise LabscriptError('The remote worker (%s) for %s must be a child of the specified gui (%s) '%(worker.name, self.name, gui.name))
+                
+            # store worker and gui as properties of the connection table
+            self.set_property('gui', gui.name, 'connection_table_properties')
+            self.set_property('worker', worker.name, 'connection_table_properties')
             
     
     # Method to set a property for this device. 
@@ -241,7 +280,7 @@ class Device(object):
         if location is None or location not in labscript_utils.properties.VALID_PROPERTY_LOCATIONS:
             raise LabscriptError('Device %s requests invalid property assignment %s for property %s'%(self.name, location, name))
             
-        # if this try failes then self."location" may not be instantiated
+        # if this try fails then self."location" may not be instantiated
         if not hasattr(self, "_properties"):
             self._properties = {}
 
@@ -423,6 +462,33 @@ class Device(object):
         group = hdf5_file['/devices'].create_group(self.name)
         return group
 
+
+class _PrimaryBLACS(Device):
+    pass
+    
+class _RemoteConnection(Device):
+    @set_passed_properties(
+        property_names = {}
+    )
+    def __init__(self, name, parent=None, connection=None):
+        if parent is None:
+            # define a hidden parent of top level remote connections so that
+            # "connection" is stored correctly in the connection table
+            if compiler._PrimaryBLACS is None:
+                compiler._PrimaryBLACS = _PrimaryBLACS('__PrimaryBLACS', None, None)
+            parent = compiler._PrimaryBLACS
+        Device.__init__(self, name, parent, connection)
+        
+        
+class RemoteBLACS(_RemoteConnection):
+    def __init__(self, name, host, port=7340, parent=None):
+        _RemoteConnection.__init__(self, name, parent, "%s:%s"%(host, port))
+        
+        
+class SecondaryControlSystem(_RemoteConnection):
+    def __init__(self, name, host, port, parent=None):
+        _RemoteConnection.__init__(self, name, parent, "%s:%s"%(host, port))
+        
 
 class IntermediateDevice(Device):
     
@@ -773,18 +839,20 @@ class Pseudoclock(Device):
         return all_times, clock
     
     def get_outputs_by_clockline(self):
-        all_outputs = self.get_all_outputs()
-        
         outputs_by_clockline = {}
+        for clock_line in self.child_devices:
+            if isinstance(clock_line, ClockLine):
+                outputs_by_clockline[clock_line] = []
+
+        all_outputs = self.get_all_outputs()
         for output in all_outputs:
             # TODO: Make this a bit more robust (can we assume things always have this hierarchy?)
             clock_line = output.parent_clock_line
             assert clock_line.parent_device == self
-            outputs_by_clockline.setdefault(clock_line, [])
             outputs_by_clockline[clock_line].append(output)
-            
+
         return all_outputs, outputs_by_clockline
-    
+
     def generate_clock(self):
         all_outputs, outputs_by_clockline = self.get_outputs_by_clockline()
         
@@ -957,8 +1025,8 @@ class Output(Device):
             unit_conversion_parameters = {}
         self.unit_conversion_class = unit_conversion_class
         self.set_properties(unit_conversion_parameters,
-                            {'unit_conversion_parameters': unit_conversion_parameters.keys()})
-        
+                            {'unit_conversion_parameters': list(unit_conversion_parameters.keys())})
+
         # Instantiate the calibration
         if unit_conversion_class is not None:
             self.calibration = unit_conversion_class(unit_conversion_parameters)
@@ -1097,7 +1165,7 @@ class Output(Device):
             self.add_instruction(self.t0, self.default_value) 
         # Check that ramps have instructions following them.
         # If they don't, insert an instruction telling them to hold their final value.
-        for instruction in self.instructions.values():
+        for instruction in list(self.instructions.values()):
             if isinstance(instruction, dict) and instruction['end time'] not in self.instructions.keys():
                 self.add_instruction(instruction['end time'], instruction['function'](instruction['end time']-instruction['initial time']), instruction['units'])
         # Checks for trigger times:
@@ -1157,7 +1225,7 @@ class Output(Device):
         """If this function is being called, it means that the parent
         Pseudoclock has requested a list of times that this output changes
         state."""        
-        times = self.instructions.keys()
+        times = list(self.instructions.keys())
         times.sort()
 
         current_dict_time = None
@@ -1166,7 +1234,7 @@ class Output(Device):
                 current_dict_time = self.instructions[time]
             elif current_dict_time is not None and current_dict_time['initial time'] < time < current_dict_time['end time']:
                 err = ("{:s} {:s} has an instruction at t={:.10f}s. This instruction collides with a ramp on this output at that time. ".format(self.description, self.name, time)+
-                       "The collision {:s} is happenging from {:.10f}s till {:.10f}s".format(inst['description'], current_dict_time['initial time'], current_dict_time['end time']))
+                       "The collision {:s} is happening from {:.10f}s till {:.10f}s".format(current_dict_time['description'], current_dict_time['initial time'], current_dict_time['end time']))
                 raise LabscriptError(err)
 
         self.times = times
@@ -1241,7 +1309,7 @@ class Output(Device):
                     # if we have limits, check the value is valid
                     if self.limits:
                         if ((outarray<self.limits[0])|(outarray>self.limits[1])).any():
-                            raise LabscriptError('The function %s called on "%s" at t=%d generated a value which falls outside the base unit limits (%d to %d)'%(self.timeseries[i]['function'],self.name,midpoints[0],limits[0],limits[1]))
+                            raise LabscriptError('The function %s called on "%s" at t=%d generated a value which falls outside the base unit limits (%d to %d)'%(self.timeseries[i]['function'],self.name,midpoints[0],self.limits[0],self.limits[1]))
                 else:
                     outarray = empty(len(time),dtype=self.dtype)
                     outarray.fill(self.timeseries[i])
@@ -1271,35 +1339,35 @@ class AnalogQuantity(Output):
                     message = ''.join(['WARNING: AnalogOutput \'%s\' has the same initial and final value at time t=%.10fs with duration %.10fs. In order to save samples and clock ticks this instruction is replaced with a constant output. '%(self.name, t, duration)])
                     sys.stderr.write(message + '\n')
             else:
-                self.add_instruction(t, {'function': functions.ramp(duration, initial, final), 'description': 'linear ramp',
+                self.add_instruction(t, {'function': functions.ramp(round(t + duration, 10) - round(t, 10), initial, final), 'description': 'linear ramp',
                                      'initial time': t, 'end time': t + truncation * duration, 'clock rate': samplerate, 'units': units})
         return truncation * duration
 
     def sine(self, t, duration, amplitude, angfreq, phase, dc_offset, samplerate, units=None, truncation=1.):
         self._check_truncation(truncation)
         if truncation > 0:
-            self.add_instruction(t, {'function': functions.sine(duration, amplitude, angfreq, phase, dc_offset), 'description': 'sine wave',
+            self.add_instruction(t, {'function': functions.sine(round(t + duration, 10) - round(t, 10), amplitude, angfreq, phase, dc_offset), 'description': 'sine wave',
                                      'initial time': t, 'end time': t + truncation*duration, 'clock rate': samplerate, 'units': units})
         return truncation*duration
 
     def sine_ramp(self, t, duration, initial, final, samplerate, units=None, truncation=1.):
         self._check_truncation(truncation)
         if truncation > 0:
-            self.add_instruction(t, {'function': functions.sine_ramp(duration, initial, final), 'description': 'sinusoidal ramp',
+            self.add_instruction(t, {'function': functions.sine_ramp(round(t + duration, 10) - round(t, 10), initial, final), 'description': 'sinusoidal ramp',
                                      'initial time': t, 'end time': t + truncation*duration, 'clock rate': samplerate, 'units': units})
         return truncation*duration
 
     def sine4_ramp(self, t, duration, initial, final, samplerate, units=None, truncation=1.):
         self._check_truncation(truncation)
         if truncation > 0:
-            self.add_instruction(t, {'function': functions.sine4_ramp(duration, initial, final), 'description': 'sinusoidal ramp',
+            self.add_instruction(t, {'function': functions.sine4_ramp(round(t + duration, 10) - round(t, 10), initial, final), 'description': 'sinusoidal ramp',
                                      'initial time': t, 'end time': t + truncation*duration, 'clock rate': samplerate, 'units': units})
         return truncation*duration
 
     def sine4_reverse_ramp(self, t, duration, initial, final, samplerate, units=None, truncation=1.):
         self._check_truncation(truncation)
         if truncation > 0:
-            self.add_instruction(t, {'function': functions.sine4_reverse_ramp(duration, initial, final), 'description': 'sinusoidal ramp',
+            self.add_instruction(t, {'function': functions.sine4_reverse_ramp(round(t + duration, 10) - round(t, 10), initial, final), 'description': 'sinusoidal ramp',
                                      'initial time': t, 'end time': t + truncation*duration, 'clock rate': samplerate, 'units': units})
         return truncation*duration
 
@@ -1340,7 +1408,7 @@ class AnalogQuantity(Output):
             raise LabscriptError(
                 'Truncation type for exp_ramp not supported. Must be either linear or exponential.')
         if trunc_duration > 0:
-            self.add_instruction(t, {'function': functions.exp_ramp(duration, initial, final, zero), 'description': 'exponential ramp',
+            self.add_instruction(t, {'function': functions.exp_ramp(round(t + duration, 10) - round(t, 10), initial, final, zero), 'description': 'exponential ramp',
                                      'initial time': t, 'end time': t + trunc_duration, 'clock rate': samplerate, 'units': units})
         return trunc_duration
 
@@ -1379,14 +1447,14 @@ class AnalogQuantity(Output):
             raise LabscriptError(
                 'Truncation type for exp_ramp_t not supported. Must be either linear or exponential.')
         if trunc_duration > 0:
-            self.add_instruction(t, {'function': functions.exp_ramp_t(duration, initial, final, time_constant), 'description': 'exponential ramp with time consntant',
+            self.add_instruction(t, {'function': functions.exp_ramp_t(round(t + duration, 10) - round(t, 10), initial, final, time_constant), 'description': 'exponential ramp with time consntant',
                                      'initial time': t, 'end time': t + trunc_duration, 'clock rate': samplerate, 'units': units})
         return trunc_duration
 
     def piecewise_accel_ramp(self, t, duration, initial, final, samplerate, units=None, truncation=1.):
         self._check_truncation(truncation)
         if truncation > 0:
-            self.add_instruction(t, {'function': functions.piecewise_accel(duration, initial, final), 'description': 'piecewise linear accelleration ramp',
+            self.add_instruction(t, {'function': functions.piecewise_accel(round(t + duration, 10) - round(t, 10), initial, final), 'description': 'piecewise linear accelleration ramp',
                                      'initial time': t, 'end time': t + truncation*duration, 'clock rate': samplerate, 'units': units})
         return truncation*duration
 
@@ -1399,7 +1467,7 @@ class AnalogQuantity(Output):
         def custom_ramp_func(t_rel):
             """The function that will return the result of the user's function,
             evaluated at relative times t_rel from 0 to duration"""
-            return function(t_rel, duration, *args, **kwargs)
+            return function(t_rel, round(t + duration, 10) - round(t, 10), *args, **kwargs)
 
         if truncation > 0:
             self.add_instruction(t, {'function': custom_ramp_func, 'description': 'custom ramp: %s' % function.__name__,
@@ -1450,8 +1518,8 @@ class StaticAnalogQuantity(Output):
         pass
     
     def expand_timeseries(self,*args,**kwargs):
-        self.raw_output = array([self.static_value])
-    
+        self.raw_output = array([self.static_value], dtype=self.dtype)
+
     @property
     def static_value(self):
         if self._static_value is None:
@@ -1470,15 +1538,29 @@ class DigitalQuantity(Output):
     dtype = uint32
     
     # Redefine __init__ so that you cannot define a limit or calibration for DO
-    @set_passed_properties(property_names = {})
-    def __init__(self, name, parent_device, connection, **kwargs):                
+    @set_passed_properties(property_names = {"connection_table_properties": ["inverted"]})
+    def __init__(self, name, parent_device, connection, inverted=False, **kwargs):
         Output.__init__(self,name,parent_device,connection, **kwargs)
-        
+        self.inverted = bool(inverted)
+
     def go_high(self,t):
-        self.add_instruction(t,1)
+        self.add_instruction(t, 1)
+
     def go_low(self,t):
-        self.add_instruction(t,0) 
-    
+        self.add_instruction(t, 0)
+
+    def enable(self,t):
+        if self.inverted:
+            self.go_low(t)
+        else:
+            self.go_high(t)
+
+    def disable(self,t):
+        if self.inverted:
+            self.go_high(t)
+        else:
+            self.go_low(t)
+
     '''
     This function only works if the DigitalQuantity is on a fast clock
     
@@ -1539,8 +1621,8 @@ class StaticDigitalQuantity(DigitalQuantity):
         pass
     
     def expand_timeseries(self,*args,**kwargs):
-        self.raw_output = array([self.static_value])
-        
+        self.raw_output = array([self.static_value], dtype=self.dtype)
+
     @property
     def static_value(self):
         if self._static_value is None:
@@ -1572,8 +1654,8 @@ class AnalogIn(Device):
         self.acquisitions.append({'start_time': start_time, 'end_time': end_time,
                                  'label': label, 'wait_label':wait_label, 'scale_factor':scale_factor,'units':units})
         return end_time - start_time
-     
-        
+
+
 class Shutter(DigitalOut):
     description = 'shutter'
     
@@ -1583,7 +1665,7 @@ class Shutter(DigitalOut):
     def __init__(self,name,parent_device,connection,delay=(0,0),open_state=1,
                  **kwargs):
 
-        DigitalOut.__init__(self, name, parent_device, connection, **kwargs)
+        DigitalOut.__init__(self, name, parent_device, connection, inverted=not bool(open_state), **kwargs)
         self.open_delay, self.close_delay = delay
         self.open_state = open_state
         if self.open_state == 1:
@@ -1592,6 +1674,7 @@ class Shutter(DigitalOut):
             self.allowed_states = {1: 'closed', 0: 'open'}
         else:
             raise LabscriptError("Shutter %s wasn't instantiated with open_state = 0 or 1." % self.name)
+        self.actual_times = {}
 
     # If a shutter is asked to do something at t=0, it cannot start moving
     # earlier than that.  So initial shutter states will have imprecise
@@ -1599,28 +1682,49 @@ class Shutter(DigitalOut):
     # would throw a warning for every shutter. The documentation will
     # have to make a point of this.
     def open(self, t):
-        if self.open_state == 1:
-            self.go_high(t-self.open_delay if t >= self.open_delay else 0)
-        elif self.open_state == 0:
-            self.go_low(t-self.open_delay if t >= self.open_delay else 0)
+        t_calc = t-self.open_delay if t >= self.open_delay else 0
+        self.actual_times[t] = {'time': t_calc, 'instruction': 1}
+        self.enable(t_calc)
 
     def close(self, t):
-        if self.open_state == 1:
-            self.go_low(t-self.close_delay if t >= self.close_delay else 0)  
-        elif self.open_state == 0:
-            self.go_high(t-self.close_delay if t >= self.close_delay else 0)
-    
+        t_calc = t-self.close_delay if t >= self.close_delay else 0
+        self.actual_times[t] = {'time': t_calc, 'instruction': 0}
+        self.disable(t_calc)
+
     def generate_code(self, hdf5_file):
         classname = self.__class__.__name__
-        calibration_table_dtypes = [('name','a256'), ('open_delay',float), ('close_delay',float)]
+        calibration_table_dtypes = dtype_workaround([('name','a256'), ('open_delay',float), ('close_delay',float)])
         if classname not in hdf5_file['calibrations']:
             hdf5_file['calibrations'].create_dataset(classname, (0,), dtype=calibration_table_dtypes, maxshape=(None,))
         metadata = (self.name,self.open_delay,self.close_delay)
         dataset = hdf5_file['calibrations'][classname]
         dataset.resize((len(dataset)+1,))
         dataset[len(dataset)-1] = metadata
-        
-        
+
+    def get_change_times(self, *args, **kwargs):
+        retval = DigitalOut.get_change_times(self, *args, **kwargs)
+
+        if len(self.actual_times)>1:
+            sorted_times = list(self.actual_times.keys())
+            sorted_times.sort()
+            for i in range(len(sorted_times)-1):
+                time = sorted_times[i]
+                next_time = sorted_times[i+1]
+                # only look at instructions that contain a state change
+                if self.actual_times[time]['instruction'] != self.actual_times[next_time]['instruction']:
+                    state1 = 'open' if self.actual_times[next_time]['instruction'] == 1 else 'close'
+                    state2 = 'opened' if self.actual_times[time]['instruction'] == 1 else 'closed'
+                    if self.actual_times[next_time]['time'] < self.actual_times[time]['time']:
+                        message = "WARNING: The shutter '{:s}' is requested to {:s} too early (taking delay into account) at t={:.10f}s when it is still not {:s} from an earlier instruction at t={:.10f}s".format(self.name, state1, next_time, state2, time)
+                        sys.stderr.write(message+'\n')
+                elif not config.suppress_mild_warnings and not config.suppress_all_warnings:
+                    state1 = 'open' if self.actual_times[next_time]['instruction'] == 1 else 'close'
+                    state2 = 'opened' if self.actual_times[time]['instruction'] == 0 else 'closed'
+                    message = "WARNING: The shutter '{:s}' is requested to {:s} at t={:.10f}s but was never {:s} after an earlier instruction at t={:.10f}s".format(self.name, state1, next_time, state2, time)
+                    sys.stderr.write(message+'\n')
+        return retval
+
+
 class Trigger(DigitalOut):
     description = 'trigger device'
     allowed_states = {1:'high', 0:'low'}
@@ -1785,14 +1889,27 @@ class StaticDDS(Device):
                  **kwargs):
         #self.clock_type = parent_device.clock_type # Don't see that this is needed anymore
         
-        #TODO: Add call to get default unit conversion classes from the parent
-        
         # We tell Device.__init__ to not call
         # self.parent.add_device(self), we'll do that ourselves later
         # after further intitialisation, so that the parent can see the
         # freq/amp/phase objects and manipulate or check them from within
         # its add_device method.
         Device.__init__(self,name,parent_device,connection, call_parents_add_device=False, **kwargs)
+
+        # Ask the parent device if it has default unit conversion classes it would like us to use:
+        if hasattr(parent_device, 'get_default_unit_conversion_classes'):
+            classes = parent_device.get_default_unit_conversion_classes(self)
+            default_freq_conv, default_amp_conv, default_phase_conv = classes
+            # If the user has not overridden, use these defaults. If
+            # the parent does not have a default for one or more of amp,
+            # freq or phase, it should return None for them.
+            if freq_conv_class is None:
+                freq_conv_class = default_freq_conv
+            if amp_conv_class is None:
+                amp_conv_class = default_amp_conv
+            if phase_conv_class is None:
+                phase_conv_class = default_phase_conv
+
         self.frequency = StaticAnalogQuantity(self.name+'_freq',self,'freq',freq_limits,freq_conv_class,freq_conv_params)
         self.amplitude = StaticAnalogQuantity(self.name+'_amp',self,'amp',amp_limits,amp_conv_class,amp_conv_params)
         self.phase = StaticAnalogQuantity(self.name+'_phase',self,'phase',phase_limits,phase_conv_class,phase_conv_params)        
@@ -1831,7 +1948,7 @@ class LabscriptError(Exception):
 
 def save_time_markers(hdf5_file):
     time_markers = compiler.time_markers
-    dtypes = [('label','a256'), ('time', float), ('color', '(1,3)uint8')]
+    dtypes = dtype_workaround([('label','a256'), ('time', float), ('color', '(1,3)uint8')])
     data_array = zeros(len(time_markers), dtype=dtypes)
     for i, t in enumerate(time_markers):
         data_array[i] = time_markers[t]["label"], t, time_markers[t]["color"]
@@ -1862,6 +1979,11 @@ def generate_connection_table(hdf5_file):
         else:
             BLACS_connection = ""
             
+            #if there is no BLACS connection, make sure there is no "gui" or "worker" entry in the connection table properties
+            if 'worker' in properties or 'gui' in properties:
+                raise LabscriptError('You cannot specify a remote GUI or worker for a device (%s) that does not have a tab in BLACS'%(device.name))
+            
+            
         connection_table.append((device.name, device.__class__.__name__,
                                  device.parent_device.name if device.parent_device else str(None),
                                  str(device.connection if device.parent_device else str(None)),
@@ -1871,11 +1993,11 @@ def generate_connection_table(hdf5_file):
                                  serialised_properties))
     
     connection_table.sort()
-    vlenstring = h5py.special_dtype(vlen=unicode)
-    connection_table_dtypes = [('name','a256'), ('class','a256'), ('parent','a256'), ('parent port','a256'),
+    vlenstring = h5py.special_dtype(vlen=str)
+    connection_table_dtypes = dtype_workaround([('name','a256'), ('class','a256'), ('parent','a256'), ('parent port','a256'),
                                ('unit conversion class','a256'), ('unit conversion params', vlenstring),
                                ('BLACS_connection','a'+str(max_BLACS_conn_length)),
-                               ('properties', vlenstring)]
+                               ('properties', vlenstring)])
     connection_table_array = empty(len(connection_table),dtype=connection_table_dtypes)
     for i, row in enumerate(connection_table):
         connection_table_array[i] = row
@@ -1911,13 +2033,14 @@ def save_labscripts(hdf5_file):
                         # Doesn't seem to want to double count files if you just import the contents of a file within a module
                         continue
                     hdf5_file.create_dataset(save_path, data=open(path).read())
-                    hg_commands = [['log', '--limit', '1'], ['status'], ['diff']]
-                    for command in hg_commands:
-                        process = subprocess.Popen(['hg'] + command + [os.path.split(path)[1]], cwd=os.path.split(path)[0],
-                                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, startupinfo=startupinfo)
-                        info, err = process.communicate()
-                        if info or err:
-                            hdf5_file[save_path].attrs['hg ' + command[0]] = info + '\n' + err
+                    if compiler.save_hg_info:
+                        hg_commands = [['log', '--limit', '1'], ['status'], ['diff']]
+                        for command in hg_commands:
+                            process = subprocess.Popen(['hg'] + command + [os.path.split(path)[1]], cwd=os.path.split(path)[0],
+                                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, startupinfo=startupinfo)
+                            info, err = process.communicate()
+                            if info or err:
+                                hdf5_file[save_path].attrs['hg ' + str(command[0])] = info.decode('utf-8') + '\n' + err.decode('utf-8')
     except ImportError:
         pass
     except WindowsError if os.name == 'nt' else None:
@@ -1941,7 +2064,7 @@ def write_device_properties(hdf5_file):
 
 
 def generate_wait_table(hdf5_file):
-    dtypes = [('label','a256'), ('time', float), ('timeout', float)]
+    dtypes = dtype_workaround([('label','a256'), ('time', float), ('timeout', float)])
     data_array = zeros(len(compiler.wait_table), dtype=dtypes)
     for i, t in enumerate(sorted(compiler.wait_table)):
         label, timeout = compiler.wait_table[t]
@@ -2080,7 +2203,10 @@ def stop(t):
             device.stop_time = t
     generate_code()
 
+# TO_DELETE:runmanager-batchompiler-agnostic
+#   entire function load_globals can be deleted
 def load_globals(hdf5_filename):
+    import runmanager
     params = runmanager.get_shot_globals(hdf5_filename)
     with h5py.File(hdf5_filename,'r') as hdf5_file:
         for name in params.keys():
@@ -2110,8 +2236,12 @@ def load_globals(hdf5_filename):
                 params[name] = None
             _builtins_dict[name] = params[name]
             
-            
-def labscript_init(hdf5_filename, labscript_file=None, new=False, overwrite=False):
+# TO_DELETE:runmanager-batchompiler-agnostic 
+#   load_globals_values=True            
+def labscript_init(hdf5_filename, labscript_file=None, new=False, overwrite=False, load_globals_values=True):
+    # save the builtins for later restoration in labscript_cleanup
+    compiler._existing_builtins_dict = _builtins_dict.copy()
+    
     if new:
         # defer file creation until generate_code(), so that filesystem
         # is not littered with h5 files when the user merely imports
@@ -2120,23 +2250,27 @@ def labscript_init(hdf5_filename, labscript_file=None, new=False, overwrite=Fals
             os.unlink(hdf5_filename)
     elif not os.path.exists(hdf5_filename):
         raise LabscriptError('Provided hdf5 filename %s doesn\'t exist.'%hdf5_filename)
-    else:
-        load_globals(hdf5_filename)
+    # TO_DELETE:runmanager-batchompiler-agnostic 
+    elif load_globals_values:
+        load_globals(hdf5_filename) 
+    # END_DELETE:runmanager-batchompiler-agnostic 
+    
     compiler.hdf5_filename = hdf5_filename
     if labscript_file is None:
         import __main__
         labscript_file = __main__.__file__
     compiler.labscript_file = os.path.abspath(labscript_file)
-
     
+
 def labscript_cleanup():
     """restores builtins and the labscript module to its state before
     labscript_init() was called"""
-    for name in _builtins_dict.copy():
-        if name not in _existing_builtins_dict:
+    for name in _builtins_dict.copy(): 
+        if name not in compiler._existing_builtins_dict:
             del _builtins_dict[name]
         else:
-            _builtins_dict[name] = _existing_builtins_dict[name]
+            _builtins_dict[name] = compiler._existing_builtins_dict[name]
+    
     compiler.inventory = []
     compiler.hdf5_filename = None
     compiler.labscript_file = None
@@ -2148,8 +2282,10 @@ def labscript_cleanup():
     compiler.trigger_duration = 0
     compiler.wait_delay = 0
     compiler.time_markers = {}
-    
-class compiler:
+    compiler._PrimaryBLACS = None
+    compiler.save_hg_info = True
+
+class compiler(object):
     # The labscript file being compiled:
     labscript_file = None
     # All defined devices:
@@ -2165,3 +2301,8 @@ class compiler:
     trigger_duration = 0
     wait_delay = 0
     time_markers = {}
+    _PrimaryBLACS = None
+    save_hg_info = True
+
+    # safety measure in case cleanup is called before init
+    _existing_builtins_dict = _builtins_dict.copy() 

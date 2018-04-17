@@ -10,8 +10,8 @@
 # the project for the full license.                                 #
 #                                                                   #
 #####################################################################
-
-from labscript import *
+from __future__ import division, unicode_literals, print_function, absolute_import
+from labscript.labscript import *
 
 try:
     from labscript_utils import check_version
@@ -39,4 +39,4 @@ check_version('labscript_utils', '2.2', '3')
 #    elif sys.argv[0]:
 #        labscript_init(sys.argv[0].replace('.py','.h5'), labscript_file=sys.argv[0], new=True, overwrite=overwrite)
 
-__version__ = '2.3.0'
+__version__ = '2.4.0'
