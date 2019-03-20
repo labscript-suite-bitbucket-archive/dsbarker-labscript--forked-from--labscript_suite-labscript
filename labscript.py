@@ -23,7 +23,7 @@ import os
 import sys
 import subprocess
 import keyword
-from inspect import getargspec
+from inspect import getcallargs
 from functools import wraps
 
 # Notes for v3
@@ -141,12 +141,16 @@ def fastflatten(inarray, dtype):
 
 def set_passed_properties(property_names = {}):
     """
-    This decorator is intended to wrap the __init__ functions and to
-    write any selected kwargs into the properties.  
+    Decorator for device __init__ methods that saves the listed arguments/keyword
+    arguments as properties. Argument values as passed to __init__ will be saved, with
+    the exception that if an instance attribute exists after __init__ has run that has
+    the same name as an argument, the instance attribute will be saved instead of the
+    argument value. This allows code within __init__ to process default arguments
+    before they are saved.
     
-    names is a dictionary {key:val}, where each val
+    property_names is a dictionary {key:val}, where each val
         is a list [var1, var2, ...] of variables to be pulled from
-        properties_dict and added to the property with name key (it's location)
+        properties_dict and added to the property with name key (its location)
         
     internally they are all accessed by calling self.get_property()
     """
@@ -156,21 +160,24 @@ def set_passed_properties(property_names = {}):
 
             return_value = func(inst, *args, **kwargs)
 
-            # Introspect arguments and named arguments functions.  in python 3 this is
-            # a pair of func.__something__ calls and no import from argspec is needed
-            a = getargspec(func)
-            
-            if a.defaults is not None:
-                args_dict = {key:val for key,val in zip(a.args[-len(a.defaults):],a.defaults)}
-            else:
-                args_dict = {}
-                
-            # Update this list with the values from the passed keywords
-            args_dict.update(kwargs)
+            # Get a dict of the call arguments/keyword arguments by name:
+            call_values = getcallargs(func, inst, *args, **kwargs)
 
-            # print args_dict
-            # print property_names
-            inst.set_properties(args_dict, property_names)
+            all_property_names = set()
+            for names in property_names.values():
+                all_property_names.update(names)
+
+            property_values = {}
+            for name in all_property_names:
+                # If there is an instance attribute with that name, use that, otherwise
+                # use the call value:
+                if hasattr(inst, name):
+                    property_values[name] = getattr(inst, name)
+                else:
+                    property_values[name] = call_values[name]
+
+            # Save them:
+            inst.set_properties(property_values, property_names)
 
             return return_value
 
@@ -187,7 +194,7 @@ class Device(object):
         property_names = {"device_properties": ["added_properties"]}
         )
     def __init__(self,name,parent_device,connection, call_parents_add_device=True, 
-                 added_properties = {}, gui=None, worker=None, **kwargs):
+                 added_properties = {}, gui=None, worker=None, start_order=None, stop_order=None, **kwargs):
         # Verify that no invalid kwargs were passed and the set properties
         if len(kwargs) != 0:        
             raise LabscriptError('Invalid keyword arguments: %s.'%kwargs)
@@ -197,6 +204,12 @@ class Device(object):
         self.name = name
         self.parent_device = parent_device
         self.connection = connection
+        self.start_order = start_order
+        self.stop_order = stop_order
+        if start_order is not None and not isinstance(start_order, int):
+            raise TypeError("start_order must be int, not %s" % type(start_order).__name__)
+        if stop_order is not None and not isinstance(stop_order, int):
+            raise TypeError("stop_order must be int, not %s" % type(stop_order).__name__)
         self.child_devices = []
         
         # self._properties may be instantiated already
@@ -391,7 +404,7 @@ class Device(object):
             return self 
         parent = self.parent_device
         try:
-            while not isinstance(parent,PseudoclockDevice):
+            while parent is not None and not isinstance(parent,PseudoclockDevice):
                 parent = parent.parent_device
             return parent
         except Exception as e:
@@ -432,7 +445,7 @@ class Device(object):
         """The earliest time output can be commanded from this device at the start of the experiment.
         This is nonzeo on secondary pseudoclock devices due to triggering delays."""
         parent = self.pseudoclock_device
-        if parent.is_master_pseudoclock:
+        if parent is None or parent.is_master_pseudoclock:
             return 0
         else:
             return round(parent.trigger_times[0] + parent.trigger_delay, 10)
@@ -499,7 +512,7 @@ class IntermediateDevice(Device):
         # this should be checked here because it should only be connected a clockline
         # The allowed_children attribute of parent classes doesn't prevent this from being connected to something that accepts 
         # an instance of 'Device' as a child
-        if not isinstance(parent_device, ClockLine):
+        if parent_device is not None and not isinstance(parent_device, ClockLine):
             if not hasattr(parent_device, 'name'):
                 parent_device_name = 'Unknown: not an instance of a labscript device class'
             else:
@@ -522,7 +535,7 @@ class ClockLine(Device):
         
     def add_device(self, device):
         Device.add_device(self, device)
-        if hasattr(device, 'clock_limit') and (self._clock_limit is None or device.clock_limit < self.clock_limit):
+        if getattr(device, 'clock_limit', None) is not None and (self._clock_limit is None or device.clock_limit < self.clock_limit):
             self._clock_limit = device.clock_limit
     
     # define a property to make sure no children overwrite this value themselves
@@ -964,7 +977,7 @@ class PseudoclockDevice(TriggerableDevice):
             
     def trigger(self, t, duration, wait_delay = 0):
         """Ask the trigger device to produce a digital pulse of a given duration to trigger this pseudoclock"""
-        if t == 'initial':
+        if type(t) in [str, bytes] and t == 'initial':
             t = self.initial_trigger_time
         t = round(t,10)
         if self.is_master_pseudoclock:
@@ -997,7 +1010,8 @@ class PseudoclockDevice(TriggerableDevice):
             # Modify the trigger times themselves so that we insert wait instructions at the right times:
             self.trigger_times = [round(t - initial_trigger_time - i*self.trigger_delay,10) for i, t in enumerate(self.trigger_times)]
         
-        # quantise the stop time to the pseudoclock clock resolution
+        # quantise the trigger times and stop time to the pseudoclock clock resolution
+        self.trigger_times = self.quantise_to_pseudoclock(self.trigger_times)
         self.stop_time = self.quantise_to_pseudoclock(self.stop_time)
                             
     def generate_code(self, hdf5_file):
@@ -1603,12 +1617,14 @@ class StaticDigitalQuantity(DigitalQuantity):
         self._static_value = None
         
     def go_high(self):
-        if self._static_value is not None:
+        if self._static_value is None:
             self.add_instruction(0,1)
             self._static_value = 1
+        else:
+            raise LabscriptError('%s %s has already been set to %s. It cannot also be set to %s.'%(self.description, self.name, self.instruction_to_string[self._static_value], self.instruction_to_string[value]))
             
     def go_low(self):
-        if self._static_value is not None:
+        if self._static_value is None:
             self.add_instruction(0,0) 
             self._static_value = 0
         else:
@@ -1777,20 +1793,21 @@ class Trigger(DigitalOut):
 class WaitMonitor(Trigger):
     
     @set_passed_properties(property_names = {})
-    def __init__(self, name, parent_device, connection, acquisition_device, acquisition_connection, timeout_device, timeout_connection,
-                  **kwargs):
+    def __init__(self, name, parent_device, connection, acquisition_device, acquisition_connection, 
+                 timeout_device, timeout_connection, timeout_trigger_type='rising', **kwargs):
 
         if compiler.wait_monitor is not None:
             raise LabscriptError("Cannot instantiate a second WaitMonitor: there can be only be one in the experiment")
         compiler.wait_monitor = self
-        Trigger.__init__(self, name, parent_device, connection, trigger_edge_type='rising', **kwargs)
+        Trigger.__init__(self, name, parent_device, connection, **kwargs)
         if not parent_device.pseudoclock_device.is_master_pseudoclock:
             raise LabscriptError('The output device for monitoring wait durations must be clocked by the master pseudoclock device')
         # TODO: acquisition_device must be the same as timeout_device at the moment (given the current BLACS implementation)
         self.acquisition_device = acquisition_device
         self.acquisition_connection = acquisition_connection 
         self.timeout_device = timeout_device
-        self.timeout_connection = timeout_connection 
+        self.timeout_connection = timeout_connection
+        self.timeout_trigger_type = timeout_trigger_type
         
         
 class DDS(Device):
@@ -1865,18 +1882,18 @@ class DDS(Device):
             raise LabscriptError('DDS %s does not have a digital gate, so you cannot use the disable(t) method.' % (self.name))
         self.gate.go_low(t)
             
-    def pulse(self, duration, amplitude, frequency, phase=None, print_summary=True):
+    def pulse(self, t, duration, amplitude, frequency, phase=None, amplitude_units = None, frequency_units = None, phase_units = None, print_summary=False):
         if print_summary:
-            print_time(t, '%s pulse at %.4f MHz for %.3f ms' % (self.name, frequency/MHz, duration/ms))
-        self.setamp(t, amplitude)
+            functions.print_time(t, '%s pulse at %.4f MHz for %.3f ms' % (self.name, frequency/MHz, duration/ms))
+        self.setamp(t, amplitude, amplitude_units)
         if frequency is not None:
-            self.setfreq(t, frequency)
+            self.setfreq(t, frequency, frequency_units)
         if phase is not None:
-            self.setphase(t, phase)
-        if amplitude != 0:
+            self.setphase(t, phase, phase_units)
+        if amplitude != 0 and self.gate is not None:
             self.enable(t)
-        self.disable(t)
-        self.setamp(t, 0)
+            self.disable(t + duration)
+            self.setamp(t + duration, 0)
         return duration
 
 
@@ -2022,7 +2039,7 @@ def save_labscripts(hdf5_file):
         import labscriptlib
         prefix = os.path.dirname(labscriptlib.__file__)
         for module in sys.modules.values():
-            if hasattr(module,'__file__'):
+            if getattr(module, '__file__', None) is not None:
                 path = os.path.abspath(module.__file__)
                 if path.startswith(prefix) and (path.endswith('.pyc') or path.endswith('.py')):
                     path = path.replace('.pyc', '.py')
@@ -2050,6 +2067,23 @@ def save_labscripts(hdf5_file):
 def write_device_properties(hdf5_file):
     for device in compiler.inventory:
         device_properties = device._properties["device_properties"]
+
+        # turn start_order and stop_order into device_properties,
+        # but only if the device has a BLACS_connection attribute. start_order
+        # or stop_order being None means the default order, zero. An order
+        # being specified on a device without a BLACS_connection is an error.
+        for attr_name in ['start_order', 'stop_order']:
+            attr = getattr(device, attr_name)
+            if hasattr(device, 'BLACS_connection'):
+                if attr is None:
+                    # Default:
+                    attr = 0
+                device_properties[attr_name] = attr
+            elif attr is not None:
+                msg = ('cannot set %s on device %s, which does ' % (attr_name, device.name) +
+                       'not have a BLACS_connection attribute and thus is not started and stopped directly by BLACS.')
+                raise TypeError(msg)
+
         # Special case: We don't create the group if the only property is an
         # empty dict called 'added properties'. This is because this property
         # is present in all devices, and represents a place to pass in
@@ -2075,12 +2109,15 @@ def generate_wait_table(hdf5_file):
         acquisition_connection = compiler.wait_monitor.acquisition_connection
         timeout_device = compiler.wait_monitor.timeout_device.name 
         timeout_connection = compiler.wait_monitor.timeout_connection
+        timeout_trigger_type = compiler.wait_monitor.timeout_trigger_type
     else:
-        acquisition_device, acquisition_connection, timeout_device, timeout_connection = '','','',''
+        acquisition_device, acquisition_connection, timeout_device, timeout_connection, timeout_trigger_type = '', '', '', '', ''
     dataset.attrs['wait_monitor_acquisition_device'] = acquisition_device
     dataset.attrs['wait_monitor_acquisition_connection'] = acquisition_connection
     dataset.attrs['wait_monitor_timeout_device'] = timeout_device
     dataset.attrs['wait_monitor_timeout_connection'] = timeout_connection
+    dataset.attrs['wait_monitor_timeout_trigger_type'] = timeout_trigger_type
+
     
 def generate_code():
     if compiler.hdf5_filename is None:
@@ -2114,7 +2151,7 @@ def generate_code():
 def trigger_all_pseudoclocks(t='initial'):
     # Must wait this long before providing a trigger, in case child clocks aren't ready yet:
     wait_delay = compiler.wait_delay
-    if t == 'initial':
+    if type(t) in [str, bytes] and t == 'initial':
         # But not at the start of the experiment:
         wait_delay = 0
     # Trigger them all:
@@ -2143,8 +2180,10 @@ def wait(label, t, timeout=5):
     compiler.wait_table[t] = str(label), float(timeout)
     return max_delay
 
-def add_time_marker(t, label, color=(0,0,0)):
+def add_time_marker(t, label, color=(0,0,0), verbose = False):
     #color in rgb
+    if verbose:
+        functions.print_time(t,label)
     compiler.time_markers[t] = {"label":label, "color":color}
 
 def start():
@@ -2178,7 +2217,15 @@ def start():
     
         # check the minimum trigger duration for the waitmonitor
         if compiler.wait_monitor is not None:
-            compiler.trigger_duration = max(compiler.trigger_duration, 2.0/compiler.wait_monitor.clock_limit)
+            wait_monitor_minimum_pulse_width = getattr(
+                compiler.wait_monitor.acquisition_device,
+                'wait_monitor_minimum_pulse_width',
+                0,
+            )
+            compiler.trigger_duration = max(
+                compiler.trigger_duration, wait_monitor_minimum_pulse_width
+            )
+            
         # Provide this, or the minimum possible pulse, whichever is longer:
         compiler.trigger_duration = max(2.0/min_clock_limit, compiler.trigger_duration) + 2*master_pseudoclock.clock_resolution
         # Must wait this long before providing a trigger, in case child clocks aren't ready yet:
