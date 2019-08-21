@@ -49,8 +49,9 @@ from labscript_utils import check_version
 check_version('qtutils', '2.0.0', '3.0.0')
 
 # Required version for dedent() function
-check_version('labscript_utils', '2.8.0', '3.0.0')
+check_version('labscript_utils', '2.14.0', '3.0.0')
 from labscript_utils import dedent
+from labscript_utils.properties import set_attributes
 
 from pylab import *
 
@@ -1060,9 +1061,6 @@ class PseudoclockDevice(TriggerableDevice):
             if compiler.wait_monitor is not None:
                 # Make the wait monitor pulse to signify starting or resumption of the experiment:
                 compiler.wait_monitor.trigger(t, duration)
-            elif t != self.initial_trigger_time:
-                raise LabscriptError("You cannot use waits in unless you have a wait monitor." +
-                                     "Please instantiate a WaitMonitor in your connection table.")
             self.trigger_times.append(t)
         else:
             TriggerableDevice.trigger(self, t, duration)
@@ -1868,17 +1866,92 @@ class Trigger(DigitalOut):
         
 class WaitMonitor(Trigger):
     
-    @set_passed_properties(property_names = {})
-    def __init__(self, name, parent_device, connection, acquisition_device, acquisition_connection, 
-                 timeout_device, timeout_connection, timeout_trigger_type='rising', **kwargs):
+    @set_passed_properties(property_names={})
+    def __init__(
+        self,
+        name,
+        parent_device,
+        connection,
+        acquisition_device,
+        acquisition_connection,
+        timeout_device=None,
+        timeout_connection=None,
+        timeout_trigger_type='rising',
+        **kwargs
+    ):
+        """Create a wait monitor. This is a device or devices, one of which:
 
+        a) outputs pulses every time the master pseudoclock begins running (either at
+           the start of the shot or after a wait
+
+        b) measures the time in between those pulses in order to determine how long the
+           experiment was paused for during waits
+
+        c) optionally, produces pulses in software time that can be used to retrigger
+           the master pseudoclock if a wait lasts longer than its specified timeout
+
+        Args:
+
+            parent_device (Device)
+                The device with buffered digital outputs that should be used to produce
+                the wait monitor pulses. This device must be one which is clocked by
+                the master pseudoclock.
+
+            connection (str)
+                The name of the output connection of parent_device that should be used
+                to produce the pulses.
+
+            acquisition_device (Device)
+                The device which is to receive those pulses as input, and that will
+                measure how long between them. This does not need to be the same device
+                as the wait monitor output device (corresponding to `parent_device` and
+                `connection`). At time of writing, the only devices in labscript that
+                can be a wait monitor acquisition device are NI DAQmx devices that have
+                counter inputs.
+
+            acquisition_connection (str)
+                The name of the input connection on `acquisition_device` that is to read
+                the wait monitor pulses. The user must manually connect the output
+                device (`parent_device`/`connection`) to this input with a cable, in
+                order that the pulses can be read by the device. On NI DAQmx devices,
+                the acquisition_connection should be the name of the counter to be used
+                such as 'Ctr0'. The physical connection should be made to the input
+                terminal corresponding to the gate of that counter.
+
+            timeout_device (Device, optional)
+                The device that should be used to produce pulses in software time if a
+                wait lasts longer than its prescribed timeout. These pulses can
+                connected to the trigger input of the master pseudoclock, via a digital
+                logic to 'AND' it with other trigger sources, in order to resume the
+                master pseudoclock upon a wait timing out. To produce these pulses
+                during a shot requires cooperation between the acquisition device and
+                the timeout device code, and at present this means only NI DAQmx devices
+                can be used as the timeout device (though it need not be the same device
+                as the acquisition device). If not set, timeout pulses will not be
+                produced and the user must manually resume the master pseudoclock via
+                other means, or abort a shot if the indended resumption mechanism fails.
+
+            timeout_connection (str, optional)
+                Which connection on the timeout device should be used to produce timeout
+                pulses. Since only NI DAQmx devices are supported at the moment, this
+                must be a digital output on a port on the NI DAQmx device that is not
+                being used. Most NI DAQmx devices have both buffered and unbuffered
+                ports, so typically one would use one line of one of the unbuffered
+                ports for the timeout output.
+
+            timeout_trigger_type (str), default `'rising'`
+                The edge type to be used for the timeout signal, either `'rising'` or
+                `'falling'`
+        """
         if compiler.wait_monitor is not None:
             raise LabscriptError("Cannot instantiate a second WaitMonitor: there can be only be one in the experiment")
         compiler.wait_monitor = self
         Trigger.__init__(self, name, parent_device, connection, **kwargs)
         if not parent_device.pseudoclock_device.is_master_pseudoclock:
             raise LabscriptError('The output device for monitoring wait durations must be clocked by the master pseudoclock device')
-        # TODO: acquisition_device must be the same as timeout_device at the moment (given the current BLACS implementation)
+        
+        if (timeout_device is not None) != (timeout_connection is not None):
+            raise LabscriptError('Must specify both timeout_device and timeout_connection, or neither')
         self.acquisition_device = acquisition_device
         self.acquisition_connection = acquisition_connection 
         self.timeout_device = timeout_device
@@ -2189,8 +2262,14 @@ def generate_wait_table(hdf5_file):
     if compiler.wait_monitor is not None:
         acquisition_device = compiler.wait_monitor.acquisition_device.name 
         acquisition_connection = compiler.wait_monitor.acquisition_connection
-        timeout_device = compiler.wait_monitor.timeout_device.name 
-        timeout_connection = compiler.wait_monitor.timeout_connection
+        if compiler.wait_monitor.timeout_device is None:
+            timeout_device = ''
+        else:
+            timeout_device = compiler.wait_monitor.timeout_device.name
+        if compiler.wait_monitor.timeout_connection is None:
+            timeout_connection = ''
+        else:
+            timeout_connection = compiler.wait_monitor.timeout_connection
         timeout_trigger_type = compiler.wait_monitor.timeout_trigger_type
     else:
         acquisition_device, acquisition_connection, timeout_device, timeout_connection, timeout_trigger_type = '', '', '', '', ''
@@ -2229,6 +2308,11 @@ def generate_code():
         write_device_properties(hdf5_file)
         generate_wait_table(hdf5_file)
         save_labscripts(hdf5_file)
+
+        # Save shot properties:
+        group = hdf5_file.create_group('shot_properties')
+        set_attributes(group, compiler.shot_properties)
+
 
 def trigger_all_pseudoclocks(t='initial'):
     # Must wait this long before providing a trigger, in case child clocks aren't ready yet:
@@ -2339,13 +2423,47 @@ def start():
         max_delay = 0
     return max_delay
     
-def stop(t):
+def stop(t, target_cycle_time=None, cycle_time_delay_after_programming=False):
+    """Indicate the end of an experiment at the given time, and initiate compilation of
+    instructions, saving them to the HDF5 file. Configure some shot options.
+    
+    t (float or None), default: `None`
+        The end time of the experiment.
+
+    target_cycle_time (float or None), default: `None`
+        How long, in seconds, after the previous shot was started, should this shot be
+        started by BLACS. This allows one to run shots at a constant rate even if they
+        are of different durations. If `None`, BLACS will run the next shot immediately
+        after the previous shot completes. Otherwise, BLACS will delay starting this
+        shot until the cycle time has elapsed. This is a request only, and may not be
+        met if running/programming/saving data from a shot takes long enough that it
+        cannot be met. This functionality requires the BLACS `cycle_time` plugin to be
+        enabled in labconfig. Its accuracy is also limited by software timing,
+        requirements of exact cycle times beyond software timing should be instead done
+        using hardware triggers to Pseudoclocks.
+
+    cycle_time_delay_after_programming (bool), default: `False`
+        Whether the BLACS cycle_time plugin should insert the required delay for the
+        target cycle time *after* programming devices, as opposed to before programming
+        them. This is more precise, but may cause some devices to output their first
+        instruction for longer than desired, since some devices begin outputting their
+        first instruction as soon as they are programmed rather than when they receive
+        their first clock tick. If not set, the *average* cycle time will still be just
+        as close to as requested (so long as there is adequate time available), however
+        the time interval between the same part of the experiment from one shot to the
+        next will not be as precise due to variations in programming time.
+    """
     # Indicate the end of an experiment and initiate compilation:
     if t == 0:
         raise LabscriptError('Stop time cannot be t=0. Please make your run a finite duration')
     for device in compiler.inventory:
         if isinstance(device, PseudoclockDevice):
             device.stop_time = t
+    if target_cycle_time is not None:
+        # Ensure we have a valid type for this
+        target_cycle_time = float(target_cycle_time)
+    compiler.shot_properties['target_cycle_time'] = target_cycle_time
+    compiler.shot_properties['cycle_time_delay_after_programming'] = cycle_time_delay_after_programming
     generate_code()
 
 # TO_DELETE:runmanager-batchompiler-agnostic
@@ -2429,6 +2547,7 @@ def labscript_cleanup():
     compiler.time_markers = {}
     compiler._PrimaryBLACS = None
     compiler.save_hg_info = True
+    compiler.shot_properties = {}
 
 class compiler(object):
     # The labscript file being compiled:
@@ -2448,6 +2567,7 @@ class compiler(object):
     time_markers = {}
     _PrimaryBLACS = None
     save_hg_info = True
+    shot_properties = {}
 
     # safety measure in case cleanup is called before init
     _existing_builtins_dict = _builtins_dict.copy() 
